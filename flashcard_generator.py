@@ -8,8 +8,13 @@ from rag_pipeline import (
 )
 from document_loader import load_pdf, load_text, load_multiple_pdfs
 
+import streamlit as st
+
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+api_key = st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None
+if not api_key:
+    api_key = os.getenv("GROQ_API_KEY")
+client = Groq(api_key=api_key)
 
 
 def generate_flashcards(context_chunks, num_cards=5, topic="general", difficulty_hint=""):
