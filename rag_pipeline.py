@@ -1,8 +1,7 @@
 import os
 os.environ["ANONYMIZED_TELEMETRY"] = "False"
 
-import chromadb
-import uuid
+import numpy as np
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 
@@ -10,18 +9,17 @@ from sentence_transformers import SentenceTransformer
 def load_embedding_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
-embedding_model = None
+embedding_model = load_embedding_model()
 
-def get_model():
-    global embedding_model
-    if embedding_model is None:
-        embedding_model = load_embedding_model()
-    return embedding_model
+# ── In-memory vector store (replaces ChromaDB) ──
+_store = {
+    "chunks": [],       # list of text chunks
+    "embeddings": None, # numpy array of embeddings
+    "sources": []        # list of source filenames (for multi-PDF)
+}
 
-chroma_client = chromadb.Client()
 
 def chunk_text(text, chunk_size=500, overlap=50):
-    """Split text into overlapping chunks"""
     words = text.split()
     chunks = []
     i = 0
@@ -31,70 +29,75 @@ def chunk_text(text, chunk_size=500, overlap=50):
         i += chunk_size - overlap
     return chunks
 
-def chunk_multiple_sources(sources, chunk_size=200, overlap=20):
-    """
-    sources: list of dicts [{"filename": ..., "text": ...}, ...]
-    Returns: list of dicts [{"chunk": ..., "source": ...}, ...]
-    """
-    all_chunks = []
-    for source in sources:
-        chunks = chunk_text(source["text"], chunk_size=chunk_size, overlap=overlap)
-        for chunk in chunks:
-            all_chunks.append({"chunk": chunk, "source": source["filename"]})
-    return all_chunks
 
 def store_in_chromadb(chunks):
-    """Store plain text chunks (no source tracking) — used for single text/YouTube input"""
-    global chroma_client
-    collection = chroma_client.get_or_create_collection(name="flashcards")
-    embeddings = get_model().encode(chunks).tolist()
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        collection.add(
-            documents=[chunk],
-            embeddings=[embedding],
-            metadatas=[{"source": "text"}],
-            ids=[str(uuid.uuid4())]
-        )
-    print(f"Stored {len(chunks)} chunks in ChromaDB")
+    """Stores chunks + embeddings in memory (function name kept for compatibility)"""
+    global _store
+    embeddings = embedding_model.encode(chunks)
+    _store["chunks"] = chunks
+    _store["embeddings"] = np.array(embeddings)
+    _store["sources"] = ["text"] * len(chunks)
+    print(f"Stored {len(chunks)} chunks in memory")
 
-def store_tagged_chunks(tagged_chunks):
-    """
-    Store chunks that carry source metadata (used for multi-PDF input).
-    tagged_chunks: list of dicts [{"chunk": ..., "source": ...}, ...]
-    """
-    global chroma_client
-    collection = chroma_client.get_or_create_collection(name="flashcards")
-    texts = [tc["chunk"] for tc in tagged_chunks]
-    embeddings = get_model().encode(texts).tolist()
-    for tc, embedding in zip(tagged_chunks, embeddings):
-        collection.add(
-            documents=[tc["chunk"]],
-            embeddings=[embedding],
-            metadatas=[{"source": tc["source"]}],
-            ids=[str(uuid.uuid4())]
-        )
-    print(f"Stored {len(tagged_chunks)} tagged chunks in ChromaDB")
 
 def retrieve_relevant_chunks(query, n_results=3):
-    """Find most relevant chunks for a given query — returns plain text list"""
-    global chroma_client
-    collection = chroma_client.get_or_create_collection(name="flashcards")
-    query_embedding = get_model().encode([query]).tolist()
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=n_results
-    )
-    return results['documents'][0]
+    """Cosine similarity search over in-memory store"""
+    global _store
+    if _store["embeddings"] is None or len(_store["chunks"]) == 0:
+        return []
+
+    query_embedding = embedding_model.encode([query])[0]
+    chunk_embeddings = _store["embeddings"]
+
+    # Cosine similarity
+    query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+    chunk_norms = chunk_embeddings / (np.linalg.norm(chunk_embeddings, axis=1, keepdims=True) + 1e-10)
+    similarities = chunk_norms @ query_norm
+
+    top_indices = np.argsort(similarities)[::-1][:n_results]
+    return [_store["chunks"][i] for i in top_indices]
+
+
+# ── Multi-source (multi-PDF) support ──
+
+def chunk_multiple_sources(sources, chunk_size=500, overlap=50):
+    """
+    sources: list of dicts [{"text": ..., "filename": ...}, ...]
+    Returns list of dicts [{"chunk": ..., "source": ...}, ...]
+    """
+    tagged_chunks = []
+    for src in sources:
+        chunks = chunk_text(src["text"], chunk_size, overlap)
+        for chunk in chunks:
+            tagged_chunks.append({"chunk": chunk, "source": src["filename"]})
+    return tagged_chunks
+
+
+def store_tagged_chunks(tagged_chunks):
+    global _store
+    texts = [item["chunk"] for item in tagged_chunks]
+    sources = [item["source"] for item in tagged_chunks]
+    embeddings = embedding_model.encode(texts)
+    _store["chunks"] = texts
+    _store["embeddings"] = np.array(embeddings)
+    _store["sources"] = sources
+    print(f"Stored {len(texts)} tagged chunks in memory")
+
 
 def retrieve_relevant_chunks_with_sources(query, n_results=3):
-    """Find most relevant chunks AND their source filenames"""
-    global chroma_client
-    collection = chroma_client.get_or_create_collection(name="flashcards")
-    query_embedding = get_model().encode([query]).tolist()
-    results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=n_results
-    )
-    docs = results['documents'][0]
-    metas = results['metadatas'][0]
-    return [{"chunk": doc, "source": meta.get("source", "unknown")} for doc, meta in zip(docs, metas)]
+    global _store
+    if _store["embeddings"] is None or len(_store["chunks"]) == 0:
+        return []
+
+    query_embedding = embedding_model.encode([query])[0]
+    chunk_embeddings = _store["embeddings"]
+
+    query_norm = query_embedding / (np.linalg.norm(query_embedding) + 1e-10)
+    chunk_norms = chunk_embeddings / (np.linalg.norm(chunk_embeddings, axis=1, keepdims=True) + 1e-10)
+    similarities = chunk_norms @ query_norm
+
+    top_indices = np.argsort(similarities)[::-1][:n_results]
+    return [
+        {"chunk": _store["chunks"][i], "source": _store["sources"][i]}
+        for i in top_indices
+    ]
