@@ -2,7 +2,8 @@ streamlit
 groq
 pdfplumber
 sentence-transformers
-chromadb
+chromadb==0.4.24
 yt-dlp
 python-dotenv
 requests
+protobuf==3.20.3
