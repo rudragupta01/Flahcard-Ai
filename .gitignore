@@ -1,0 +1,9 @@
+.env
+cookies.txt
+__pycache__/
+*.pyc
+chroma_db/
+spaced_repetition_data.json
+.streamlit/secrets.toml
+venv/
+.vscode/

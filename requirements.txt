@@ -1,0 +1,8 @@
+streamlit
+groq
+pdfplumber
+sentence-transformers
+chromadb
+yt-dlp
+python-dotenv
+requests
