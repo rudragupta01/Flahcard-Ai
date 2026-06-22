@@ -6,13 +6,10 @@ import tempfile
 import glob
 from dotenv import load_dotenv
 from groq import Groq
-import streamlit as st
 
 load_dotenv()
-api_key = st.secrets.get("GROQ_API_KEY") if hasattr(st, "secrets") else None
-if not api_key:
-    api_key = os.getenv("GROQ_API_KEY")
-client = Groq(api_key=api_key)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
 SPAM_WORDS = [
     'subscribe', 'like', 'comment', 'share', 'notification',
     'bell icon', 'channel', 'video', 'watch', 'click',

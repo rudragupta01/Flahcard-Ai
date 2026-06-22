@@ -1,8 +1,8 @@
 import streamlit as st
 import os
 import tempfile
-import csv
 import io
+import chromadb
 import random
 
 st.set_page_config(
@@ -295,10 +295,7 @@ html, body, [data-testid="stAppViewContainer"] {
     text-align: center; color: var(--accent);
 }
 
-.warm-divider {
-    height: 1px; background: var(--border);
-    margin: 2rem 0;
-}
+.warm-divider { height: 1px; background: var(--border); margin: 2rem 0; }
 
 .cards-header {
     display: flex; align-items: baseline; justify-content: space-between;
@@ -365,13 +362,75 @@ document.addEventListener('click', function(e) {
 """, unsafe_allow_html=True)
 
 # ── Imports ────────────────────────────────────────────────────────────────
-from flashcard_generator import run_full_pipeline, generate_quiz
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.lib.units import cm
+from reportlab.lib import colors as rl_colors
+
+from flashcard_generator import run_full_pipeline, generate_quiz, run_multi_pdf_pipeline
 from youtube_loader import load_youtube
 from rag_pipeline import load_embedding_model
 from spaced_repetition import record_result, get_due_cards, get_box_summary
 
 with st.spinner("Loading..."):
     load_embedding_model()
+
+# ── PDF generator helper ───────────────────────────────────────────────────
+def generate_pdf(cards):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        rightMargin=2*cm, leftMargin=2*cm,
+        topMargin=2*cm, bottomMargin=2*cm
+    )
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        'Title', parent=styles['Heading1'],
+        fontSize=18, textColor=rl_colors.HexColor('#2C1F0E'),
+        spaceAfter=6, fontName='Times-Bold'
+    )
+    card_num_style = ParagraphStyle(
+        'CardNum', parent=styles['Normal'],
+        fontSize=8, textColor=rl_colors.HexColor('#B0967A'),
+        spaceAfter=4, fontName='Helvetica'
+    )
+    question_style = ParagraphStyle(
+        'Question', parent=styles['Normal'],
+        fontSize=12, textColor=rl_colors.HexColor('#2C1F0E'),
+        spaceAfter=6, fontName='Times-Roman', leading=16
+    )
+    answer_label_style = ParagraphStyle(
+        'AnswerLabel', parent=styles['Normal'],
+        fontSize=8, textColor=rl_colors.HexColor('#B0967A'),
+        spaceAfter=3, fontName='Helvetica'
+    )
+    answer_style = ParagraphStyle(
+        'Answer', parent=styles['Normal'],
+        fontSize=11, textColor=rl_colors.HexColor('#7A6248'),
+        spaceAfter=4, fontName='Times-Roman', leading=15
+    )
+
+    story = []
+    story.append(Paragraph("FlashMind AI — Flashcards", title_style))
+    story.append(Spacer(1, 0.4*cm))
+    story.append(HRFlowable(width="100%", thickness=1, color=rl_colors.HexColor('#E8DDD0')))
+    story.append(Spacer(1, 0.4*cm))
+
+    for i, card in enumerate(cards):
+        source = f" · {card['source']}" if card.get('source') else ""
+        story.append(Paragraph(f"CARD {i+1} OF {len(cards)}{source.upper()}", card_num_style))
+        story.append(Paragraph(card['question'], question_style))
+        story.append(Paragraph("ANSWER", answer_label_style))
+        story.append(Paragraph(card['answer'], answer_style))
+        story.append(Spacer(1, 0.3*cm))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=rl_colors.HexColor('#E8DDD0')))
+        story.append(Spacer(1, 0.4*cm))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
 
 # ── Session state ──────────────────────────────────────────────────────────
 for key, val in {
@@ -399,11 +458,11 @@ def reset_quiz():
     st.session_state.quiz_selected = None
 
 def reset_chromadb():
-    """Clears the in-memory vector store (kept function name for compatibility)"""
-    from rag_pipeline import _store
-    _store["chunks"] = []
-    _store["embeddings"] = None
-    _store["sources"] = []
+    try:
+        c = chromadb.Client()
+        try: c.delete_collection("flashcards")
+        except: pass
+    except: pass
 
 def get_difficulty_hint(d):
     if d == "Easy":
@@ -420,7 +479,6 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Page title ────────────────────────────────────────────────────────────
 st.markdown("""
 <h1 class="page-title">Your personal<br>study companion.</h1>
 <p class="page-sub">Drop in a PDF, paste some notes, or share a YouTube link — and get flashcards ready to study in seconds.</p>
@@ -438,7 +496,7 @@ with tab_gen:
 
     with input_tab_pdf:
         st.markdown('<div class="input-card">', unsafe_allow_html=True)
-        uploaded_file = st.file_uploader("Drop your PDF here", type=["pdf"], label_visibility="visible")
+        uploaded_files = st.file_uploader("Drop your PDFs here (you can select multiple)", type=["pdf"], accept_multiple_files=True, label_visibility="visible")
         st.markdown("<br>", unsafe_allow_html=True)
         col1, col2, col3 = st.columns([2, 1, 2])
         with col1:
@@ -449,22 +507,39 @@ with tab_gen:
             topic_pdf = st.text_input("Topic (optional)", placeholder="e.g. Neural Networks", key="topic_pdf")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if uploaded_file:
+        if uploaded_files:
+            st.markdown(f"<p style='color:var(--text-muted); font-size:0.85rem;'>{len(uploaded_files)} file(s) selected</p>", unsafe_allow_html=True)
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Generate flashcards →", key="gen_pdf"):
                 reset_chromadb(); reset_study(); reset_quiz()
                 progress_placeholder = st.empty()
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                    tmp.write(uploaded_file.read())
-                    tmp_path = tmp.name
+                temp_paths = []
                 try:
-                    with st.spinner("Reading your PDF..."):
-                        cards = run_full_pipeline(
-                            pdf_path=tmp_path,
-                            topic=topic_pdf if topic_pdf.strip() else "key concepts",
-                            num_cards=num_cards_pdf,
-                            difficulty_hint=get_difficulty_hint(difficulty_pdf)
-                        )
+                    file_paths_with_names = []
+                    for f in uploaded_files:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                            tmp.write(f.read())
+                            temp_paths.append(tmp.name)
+                            file_paths_with_names.append((tmp.name, f.name))
+
+                    with st.spinner(f"Reading {len(uploaded_files)} PDF(s)..."):
+                        if len(uploaded_files) == 1:
+                            cards = run_full_pipeline(
+                                pdf_path=temp_paths[0],
+                                topic=topic_pdf if topic_pdf.strip() else "key concepts",
+                                num_cards=num_cards_pdf,
+                                difficulty_hint=get_difficulty_hint(difficulty_pdf)
+                            )
+                            for c in cards:
+                                c['source'] = uploaded_files[0].name
+                        else:
+                            cards = run_multi_pdf_pipeline(
+                                file_paths_with_names,
+                                topic=topic_pdf if topic_pdf.strip() else "key concepts",
+                                num_cards=num_cards_pdf,
+                                difficulty_hint=get_difficulty_hint(difficulty_pdf)
+                            )
+
                     st.session_state.flashcards = cards
                     st.session_state.quiz_questions = []
                     st.session_state.study_started = False
@@ -479,7 +554,8 @@ with tab_gen:
                 except Exception as e:
                     st.error(f"Something went wrong: {e}")
                 finally:
-                    os.unlink(tmp_path)
+                    for p in temp_paths:
+                        os.unlink(p)
 
     with input_tab_text:
         st.markdown('<div class="input-card">', unsafe_allow_html=True)
@@ -574,6 +650,7 @@ with tab_gen:
                     except Exception as e:
                         st.error(f"Something went wrong: {e}")
 
+    # ── Flashcard display ──
     if st.session_state.flashcards:
         cards = st.session_state.flashcards
         st.markdown('<div class="warm-divider"></div>', unsafe_allow_html=True)
@@ -589,9 +666,10 @@ with tab_gen:
 
         cards_html = ""
         for i, card in enumerate(cards):
+            source_tag = f"<span style='color:var(--text-muted); font-weight:400;'> · {card['source']}</span>" if card.get('source') else ""
             cards_html += f"""
             <div class="flashcard">
-                <div class="card-number">Card {i+1} of {len(cards)}</div>
+                <div class="card-number">Card {i+1} of {len(cards)}{source_tag}</div>
                 <div class="card-question">{card['question']}</div>
                 <div class="card-divider"></div>
                 <div class="card-answer-label">Answer</div>
@@ -600,12 +678,13 @@ with tab_gen:
             """
         st.markdown(cards_html, unsafe_allow_html=True)
 
-        csv_buffer = io.StringIO()
-        writer = csv.DictWriter(csv_buffer, fieldnames=["question", "answer"])
-        writer.writeheader()
-        writer.writerows(cards)
-        st.download_button("↓ Download as CSV", data=csv_buffer.getvalue(),
-            file_name="flashcards.csv", mime="text/csv")
+        pdf_data = generate_pdf(cards)
+        st.download_button(
+            "↓ Download as PDF",
+            data=pdf_data,
+            file_name="flashcards.pdf",
+            mime="application/pdf"
+        )
 
 
 # ════════════════════════════════════════════════════════════════════
