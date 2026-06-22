@@ -6,3 +6,4 @@ numpy
 yt-dlp
 python-dotenv
 requests
+reportlab
